@@ -273,10 +273,11 @@ class GCLoss_v2(nn.Module):
             rank=0,
             world_size=1,
             distributed=False,
-            enable_isogclr=False,
+            temperature_scheme="global_constant",
             tau_min=0.005, tau_max=0.05, rho=6.0, eta=0.01, beta=0.9,
             gamma_schedule='constant',
             gamma_decay_epochs=-1,
+            **kwargs,
             ):
         super(GCLoss_v2, self).__init__()
         self.cache_labels = cache_labels
@@ -301,9 +302,11 @@ class GCLoss_v2(nn.Module):
 
         self.eps = 1e-20
 
-        # setting for isogclr
-        self.enable_isogclr = enable_isogclr
-        if self.enable_isogclr:
+        # setting for temperature scheme
+        self.temperature_scheme = temperature_scheme
+        if "enable_isogclr" in kwargs.keys() and kwargs["enable_isogclr"]:
+            self.temperature_scheme = "individual_learnable"
+        if self.temperature_scheme == "individual_learnable":
             self.tau_min, self.tau_max = tau_min, tau_max
             self.rho = rho
             self.eta = eta
@@ -312,6 +315,9 @@ class GCLoss_v2(nn.Module):
             self.learnable_tau_txt = torch.ones(N).reshape(-1, 1) * self.tau
             self.grad_tau_img = torch.zeros(N).reshape(-1, 1)
             self.grad_tau_txt = torch.zeros(N).reshape(-1, 1)
+        elif self.temperature_scheme == "global_learnable":
+            self.rho = rho
+            self.tau = torch.tensor(self.tau, requires_grad=True)
 
         self.gamma_schedule = gamma_schedule
         assert self.gamma_schedule in ["constant", "cosine"]
@@ -373,7 +379,7 @@ class GCLoss_v2(nn.Module):
         labels_onehot = F.one_hot(labels, large_batch_size)    
         neg_mask = 1 - labels_onehot
         
-        if self.enable_isogclr:
+        if self.temperature_scheme == "individual_learnable":
             tau_img = self.learnable_tau_img[index].to(device)
             tau_txt = self.learnable_tau_txt[index].to(device)
         else:
@@ -434,7 +440,7 @@ class GCLoss_v2(nn.Module):
          
         total_loss = (img_loss + txt_loss)/2
 
-        if self.enable_isogclr:
+        if self.temperature_scheme == "individual_learnable":
             grad_tau_img = torch.log(u1.detach()) + self.rho + self.b1[index].to(device) \
                             - torch.sum(p1 * logits_image_d_tau, dim=1, keepdim=True)/(large_batch_size-1)
             grad_tau_txt = torch.log(u2.detach()) + self.rho + self.b2[index].to(device) \
@@ -446,6 +452,10 @@ class GCLoss_v2(nn.Module):
             self.learnable_tau_txt[index] = (self.learnable_tau_txt[index] - self.eta * self.grad_tau_txt[index]).clamp_(min=self.tau_min, max=self.tau_max)
 
             return total_loss, (tau_img.mean(), tau_txt.mean())
+        elif self.temperature_scheme == "global_learnable":
+            total_loss = total_loss * self.tau.detach()
+            total_loss = total_loss + self.rho * self.tau
+            total_loss = total_loss + torch.mean(u1 + u2) / 2 * self.tau
 
         return total_loss, None
 
